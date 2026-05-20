@@ -364,7 +364,9 @@ export function useComposerState(options: UseComposerStateOptions): UseComposerS
     if (persistDraft && newWorkspaceDraft?.linkedGitLabIssue !== undefined) {
       return newWorkspaceDraft.linkedGitLabIssue
     }
-    return null
+    return initialLinkedWorkItem?.type === 'issue' && /gitlab\./i.test(initialLinkedWorkItem.url)
+      ? initialLinkedWorkItem.number
+      : null
   })
   const [linkedGitLabMR, setLinkedGitLabMR] = useState<number | null>(() => {
     if (persistDraft && newWorkspaceDraft?.linkedGitLabMR !== undefined) {

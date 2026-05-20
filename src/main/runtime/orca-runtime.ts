@@ -5873,6 +5873,8 @@ export class OrcaRuntimeService {
     linkedIssue?: number | null
     linkedPR?: number | null
     linkedLinearIssue?: string
+    linkedGitLabMR?: number | null
+    linkedGitLabIssue?: number | null
     comment?: string
     displayName?: string
     workspaceStatus?: string
@@ -6064,6 +6066,10 @@ export class OrcaRuntimeService {
       ...(args.linkedPR !== undefined ? { linkedPR: args.linkedPR } : {}),
       ...(args.linkedLinearIssue !== undefined
         ? { linkedLinearIssue: args.linkedLinearIssue }
+        : {}),
+      ...(args.linkedGitLabMR !== undefined ? { linkedGitLabMR: args.linkedGitLabMR } : {}),
+      ...(args.linkedGitLabIssue !== undefined
+        ? { linkedGitLabIssue: args.linkedGitLabIssue }
         : {}),
       ...(args.createdWithAgent ? { createdWithAgent: args.createdWithAgent } : {}),
       ...(args.comment !== undefined ? { comment: args.comment } : {}),

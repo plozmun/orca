@@ -3,7 +3,7 @@ GitLab IPC handlers co-located keeps the repo-path validation pattern
 reviewable as one surface. */
 import { ipcMain } from 'electron'
 import { resolve } from 'path'
-import type { GitLabIssueUpdate, Repo } from '../../shared/types'
+import type { GitLabIssueUpdate, GitLabWorkItem, Repo } from '../../shared/types'
 import type { Store } from '../persistence'
 import {
   addIssueComment,
@@ -77,12 +77,23 @@ export function registerGitLabHandlers(store: Store): void {
       }
     ) => {
       const repo = assertRegisteredRepo(args.repoPath, store)
-      return listMergeRequests(
+      const result = await listMergeRequests(
         repo.path,
         args.state ?? 'opened',
         args.page ?? 1,
         args.perPage ?? 20
       )
+      console.log(
+        '[GitLab IPC debug] listMRs:',
+        args.repoPath,
+        'state:',
+        args.state,
+        'items:',
+        result.items.length,
+        'error:',
+        result.error?.message ?? 'none'
+      )
+      return result
     }
   )
 
@@ -93,13 +104,39 @@ export function registerGitLabHandlers(store: Store): void {
 
   ipcMain.handle(
     'gitlab:listIssues',
-    async (_event, args: { repoPath: string; limit?: number }) => {
+    async (
+      _event,
+      args: {
+        repoPath: string
+        state?: 'opened' | 'closed' | 'all'
+        assignee?: string
+        limit?: number
+      }
+    ) => {
       const repo = assertRegisteredRepo(args.repoPath, store)
-      const result = await listIssues(repo.path, args.limit ?? 20)
-      // Why: parallel to gh:listIssues which returns just items[]. The
-      // structured envelope is preserved for callers that need the
-      // classified error; bare-items consumers get the same shape.
-      return result.items
+      const result = await listIssues(
+        repo.path,
+        args.limit ?? 20,
+        undefined,
+        args.state ?? 'opened',
+        args.assignee
+      )
+      // Why: Tasks page expects GitLabWorkItem[] so it can share row
+      // rendering with MRs. Map IssueInfo → WorkItem here so the renderer
+      // doesn't need a separate code path.
+      const workItems: GitLabWorkItem[] = result.items.map((issue) => ({
+        id: `gitlab-issue-${repo.id}-${issue.number}`,
+        type: 'issue' as const,
+        number: issue.number,
+        title: issue.title,
+        state: issue.state,
+        url: issue.url,
+        labels: issue.labels,
+        updatedAt: issue.updatedAt ?? '',
+        author: issue.author ?? null,
+        repoId: repo.id
+      }))
+      return { items: workItems, ...(result.error ? { error: result.error } : {}) }
     }
   )
 
