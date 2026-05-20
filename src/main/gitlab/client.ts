@@ -317,12 +317,6 @@ export async function listWorkItems(
   const issueState = mrStateToIssueState(state)
   const knownHosts = await getGlabKnownHosts()
   const { source: projectRef } = await resolveIssueSource(repoPath, preference, knownHosts)
-  console.log(
-    '[GitLab backend debug] listMergeRequests projectRef:',
-    projectRef,
-    'for repo:',
-    repoPath
-  )
   if (!projectRef) {
     return {
       items: [],

@@ -83,16 +83,6 @@ export function registerGitLabHandlers(store: Store): void {
         args.page ?? 1,
         args.perPage ?? 20
       )
-      console.log(
-        '[GitLab IPC debug] listMRs:',
-        args.repoPath,
-        'state:',
-        args.state,
-        'items:',
-        result.items.length,
-        'error:',
-        result.error?.message ?? 'none'
-      )
       return result
     }
   )
