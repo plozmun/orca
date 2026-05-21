@@ -1,3 +1,5 @@
+/* eslint-disable max-lines -- Why: GitLab MR operation tests share one hoisted
+   gl-utils mock; splitting the file would duplicate brittle mock setup. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as GlUtils from './gl-utils'
 
@@ -229,14 +231,34 @@ describe('gitlab client — MR operations', () => {
         isCrossRepository: false,
         repoId: 'g/p'
       })
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        [
+          'mr',
+          'list',
+          '--output',
+          'json',
+          '--per-page',
+          '20',
+          '--page',
+          '1',
+          '--order',
+          'updated_at',
+          '--sort',
+          'desc',
+          '--repo',
+          'https://gitlab.com/g/p'
+        ],
+        { cwd: '/repo' }
+      )
     })
 
-    it("omits the state flag when state='all'", async () => {
+    it("passes --all when state='all'", async () => {
       getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
       glabExecFileAsyncMock.mockResolvedValueOnce({ stdout: '[]' })
 
       await listMergeRequests('/repo', 'all', 1, 20)
       const callArgs = glabExecFileAsyncMock.mock.calls[0][0] as string[]
+      expect(callArgs).toContain('--all')
       expect(callArgs).not.toContain('--opened')
       expect(callArgs).not.toContain('--merged')
       expect(callArgs).not.toContain('--closed')
@@ -300,7 +322,10 @@ describe('gitlab client — MR operations', () => {
       const result = await listMergeRequests('/repo', 'opened')
       expect(result.items).toHaveLength(1)
       expect(result.items[0].title).toBe('fallback mr')
-      expect(glabExecFileAsyncMock).toHaveBeenCalled()
+      const callArgs = glabExecFileAsyncMock.mock.calls[0][0] as string[]
+      expect(callArgs).toContain('--order')
+      expect(callArgs).toContain('updated_at')
+      expect(callArgs).not.toContain('--repo')
     })
 
     it('classifies CLI errors into the result envelope', async () => {

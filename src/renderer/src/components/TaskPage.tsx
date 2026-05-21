@@ -160,6 +160,16 @@ const GITLAB_ISSUE_FILTERS: { id: GitLabIssueFilter; label: string }[] = [
   { id: 'opened', label: 'Open' },
   { id: 'assigned-to-me', label: 'Assigned to me' }
 ]
+
+function isGitLabMRFilter(value: GitLabTaskFilter | GitLabIssueFilter): value is GitLabTaskFilter {
+  return value === 'opened' || value === 'merged' || value === 'closed' || value === 'all'
+}
+
+function isGitLabIssueFilter(
+  value: GitLabTaskFilter | GitLabIssueFilter
+): value is GitLabIssueFilter {
+  return value === 'opened' || value === 'assigned-to-me'
+}
 type TaskQueryPreset = {
   id: TaskViewPresetId
   label: string
@@ -1902,12 +1912,17 @@ export default function TaskPage(): React.JSX.Element {
   const [gitlabTodos, setGitlabTodos] = useState<GitLabTodo[]>([])
   const [gitlabTodosLoading, setGitlabTodosLoading] = useState(false)
 
-  // Why: reset filter to 'opened' when switching to Issues if the current
-  // filter is 'merged' (issues don't have a merged state).
+  // Why: Issues and MRs expose different filter sets. Reset before fetching
+  // so a stale chip cannot become an invalid glab CLI flag.
   useEffect(() => {
-    if (gitlabView === 'issues' && gitlabFilter === 'merged') {
+    const filterIsValid =
+      gitlabView === 'issues'
+        ? isGitLabIssueFilter(gitlabFilter)
+        : gitlabView === 'mrs'
+          ? isGitLabMRFilter(gitlabFilter)
+          : true
+    if (!filterIsValid) {
       setGitlabFilter('opened')
-      setGitlabRefreshNonce((n) => n + 1)
     }
   }, [gitlabView, gitlabFilter])
 
@@ -2400,6 +2415,16 @@ export default function TaskPage(): React.JSX.Element {
     if (gitlabView === 'todos') {
       return
     }
+    const activeIssueFilter =
+      gitlabView === 'issues' && isGitLabIssueFilter(gitlabFilter) ? gitlabFilter : null
+    const activeMRFilter =
+      gitlabView === 'mrs' && isGitLabMRFilter(gitlabFilter) ? gitlabFilter : null
+    if (
+      (gitlabView === 'issues' && !activeIssueFilter) ||
+      (gitlabView === 'mrs' && !activeMRFilter)
+    ) {
+      return
+    }
     // Why: GitLab queries don't work over SSH-relay (yet) and folder-
     // mode repos have no remotes to derive a project from. Filter both.
     const eligibleRepos = selectedRepos.filter((r) => !r.connectionId)
@@ -2413,32 +2438,14 @@ export default function TaskPage(): React.JSX.Element {
     setGitlabLoading(true)
     setGitlabError(null)
 
-    // Why: log which repos are being queried so the user can verify the
-    // selected set matches their expectations.
-    console.log(
-      '[GitLab debug] selectedRepos count:',
-      selectedRepos.length,
-      'eligible (no SSH) count:',
-      eligibleRepos.length
-    )
-    console.log(
-      '[GitLab debug] eligibleRepos:',
-      eligibleRepos.map((r) => ({
-        id: r.id,
-        path: r.path,
-        name: r.displayName,
-        connectionId: r.connectionId ?? null
-      }))
-    )
-
     const fetchItems =
       gitlabView === 'issues'
         ? (repo: (typeof eligibleRepos)[0]) => {
-            const isAssignedToMe = gitlabFilter === 'assigned-to-me'
+            const isAssignedToMe = activeIssueFilter === 'assigned-to-me'
             return window.api.gl
               .listIssues({
                 repoPath: repo.path,
-                state: isAssignedToMe ? 'opened' : (gitlabFilter as 'opened' | 'closed' | 'all'),
+                state: 'opened',
                 assignee: isAssignedToMe ? '@me' : undefined,
                 limit: 50
               })
@@ -2451,14 +2458,6 @@ export default function TaskPage(): React.JSX.Element {
                 // (e.g. a GitHub-only repo in a mixed selection). Drop it
                 // silently so the GitLab list doesn't show false errors.
                 const error = typed.error?.type === 'not_found' ? undefined : typed.error
-                console.log(
-                  '[GitLab debug] listIssues result:',
-                  repo.displayName,
-                  'items:',
-                  typed.items.length,
-                  'error:',
-                  error?.message ?? 'none'
-                )
                 return { repoId: repo.id, items: typed.items, error }
               })
           }
@@ -2466,7 +2465,7 @@ export default function TaskPage(): React.JSX.Element {
             window.api.gl
               .listMRs({
                 repoPath: repo.path,
-                state: gitlabFilter as GitLabTaskFilter,
+                state: activeMRFilter ?? 'opened',
                 page: 1,
                 perPage: 50
               })
@@ -2476,14 +2475,6 @@ export default function TaskPage(): React.JSX.Element {
                   error?: { type?: string; message: string }
                 }
                 const error = typed.error?.type === 'not_found' ? undefined : typed.error
-                console.log(
-                  '[GitLab debug] listMRs result:',
-                  repo.displayName,
-                  'items:',
-                  typed.items.length,
-                  'error:',
-                  error?.message ?? 'none'
-                )
                 return { repoId: repo.id, items: typed.items, error }
               })
 
@@ -2508,13 +2499,11 @@ export default function TaskPage(): React.JSX.Element {
         }
         merged.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))
         setGitlabItems(merged)
-        // Why: surface errors when EVERY eligible repo failed, but also
-        // log partial failures to the console so developers can debug.
-        if (errs.length > 0) {
-          console.error('[GitLab fetch errors]', errs)
-          if (merged.length === 0) {
-            setGitlabError(errs[0])
-          }
+        // Why: only surface an error banner when EVERY eligible repo failed.
+        // Mixed selections often include non-GitLab repos, and a partial
+        // banner would hide the working rows.
+        if (errs.length > 0 && merged.length === 0) {
+          setGitlabError(errs[0])
         }
       })
       .finally(() => {

@@ -3,7 +3,7 @@ GitLab IPC handlers co-located keeps the repo-path validation pattern
 reviewable as one surface. */
 import { ipcMain } from 'electron'
 import { resolve } from 'path'
-import type { GitLabIssueUpdate, GitLabWorkItem, Repo } from '../../shared/types'
+import type { GitLabIssueUpdate, GitLabWorkItem, MRListState, Repo } from '../../shared/types'
 import type { Store } from '../persistence'
 import {
   addIssueComment,
@@ -42,6 +42,29 @@ function assertRegisteredRepo(repoPath: string, store: Store): Repo {
   return repo
 }
 
+function normalizePositiveInteger(value: unknown, fallback: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback
+  }
+  return Math.min(Math.max(1, Math.trunc(value)), max)
+}
+
+function normalizeMRListState(value: unknown): MRListState {
+  return value === 'merged' || value === 'closed' || value === 'all' ? value : 'opened'
+}
+
+type GitLabIssueListState = 'opened' | 'closed' | 'all'
+
+function normalizeIssueListState(value: unknown): GitLabIssueListState {
+  return value === 'closed' || value === 'all' ? value : 'opened'
+}
+
+function normalizeIssueAssignee(value: unknown): '@me' | undefined {
+  // Why: the renderer only exposes "Assigned to me"; accepting arbitrary
+  // values here would turn this IPC boundary into a generic glab flag surface.
+  return value === '@me' ? '@me' : undefined
+}
+
 export function registerGitLabHandlers(store: Store): void {
   ipcMain.handle('gitlab:viewer', async () => {
     return getAuthenticatedViewer()
@@ -77,12 +100,10 @@ export function registerGitLabHandlers(store: Store): void {
       }
     ) => {
       const repo = assertRegisteredRepo(args.repoPath, store)
-      const result = await listMergeRequests(
-        repo.path,
-        args.state ?? 'opened',
-        args.page ?? 1,
-        args.perPage ?? 20
-      )
+      const state = normalizeMRListState(args.state)
+      const page = normalizePositiveInteger(args.page, 1, 10_000)
+      const perPage = normalizePositiveInteger(args.perPage, 20, 100)
+      const result = await listMergeRequests(repo.path, state, page, perPage)
       return result
     }
   )
@@ -104,13 +125,10 @@ export function registerGitLabHandlers(store: Store): void {
       }
     ) => {
       const repo = assertRegisteredRepo(args.repoPath, store)
-      const result = await listIssues(
-        repo.path,
-        args.limit ?? 20,
-        undefined,
-        args.state ?? 'opened',
-        args.assignee
-      )
+      const limit = normalizePositiveInteger(args.limit, 20, 100)
+      const state = normalizeIssueListState(args.state)
+      const assignee = normalizeIssueAssignee(args.assignee)
+      const result = await listIssues(repo.path, limit, undefined, state, assignee)
       // Why: Tasks page expects GitLabWorkItem[] so it can share row
       // rendering with MRs. Map IssueInfo → WorkItem here so the renderer
       // doesn't need a separate code path.
@@ -179,7 +197,12 @@ export function registerGitLabHandlers(store: Store): void {
       }
     ) => {
       const repo = assertRegisteredRepo(args.repoPath, store)
-      return listWorkItems(repo.path, args.state ?? 'opened', args.page ?? 1, args.perPage ?? 20)
+      return listWorkItems(
+        repo.path,
+        normalizeMRListState(args.state),
+        normalizePositiveInteger(args.page, 1, 10_000),
+        normalizePositiveInteger(args.perPage, 20, 100)
+      )
     }
   )
 

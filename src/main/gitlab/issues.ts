@@ -119,6 +119,10 @@ export async function listIssues(
         'json',
         '--per-page',
         String(limit),
+        '--order',
+        'updated_at',
+        '--sort',
+        'desc',
         ...stateFlag,
         ...assigneeFlag
       ],

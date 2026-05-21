@@ -44,6 +44,7 @@ import {
   getLinkedWorkItemSuggestedName,
   getSetupConfig,
   getWorkspaceSeedName,
+  isGitLabIssueUrl,
   PER_REPO_FETCH_LIMIT,
   renderIssueCommandTemplate,
   type LinkedWorkItemSummary,
@@ -345,7 +346,11 @@ export function useComposerState(options: UseComposerStateOptions): UseComposerS
     if (persistDraft && newWorkspaceDraft?.linkedIssue) {
       return newWorkspaceDraft.linkedIssue
     }
-    if (initialLinkedWorkItem?.type === 'issue' && !initialLinkedWorkItem.linearIdentifier) {
+    if (
+      initialLinkedWorkItem?.type === 'issue' &&
+      !initialLinkedWorkItem.linearIdentifier &&
+      !isGitLabIssueUrl(initialLinkedWorkItem.url)
+    ) {
       return String(initialLinkedWorkItem.number)
     }
     return ''
@@ -364,7 +369,7 @@ export function useComposerState(options: UseComposerStateOptions): UseComposerS
     if (persistDraft && newWorkspaceDraft?.linkedGitLabIssue !== undefined) {
       return newWorkspaceDraft.linkedGitLabIssue
     }
-    return initialLinkedWorkItem?.type === 'issue' && /gitlab\./i.test(initialLinkedWorkItem.url)
+    return initialLinkedWorkItem?.type === 'issue' && isGitLabIssueUrl(initialLinkedWorkItem.url)
       ? initialLinkedWorkItem.number
       : null
   })

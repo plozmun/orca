@@ -18,6 +18,7 @@ import type {
   BrowserSessionProfileSource,
   BrowserViewportOverride,
   ClaudeRateLimitAccountsState,
+  ClassifiedError,
   CodexRateLimitAccountsState,
   CreateWorktreeArgs,
   CreateWorktreeResult,
@@ -1067,7 +1068,7 @@ export type PreloadApi = {
       state?: 'opened' | 'closed' | 'all'
       assignee?: string
       limit?: number
-    }) => Promise<unknown>
+    }) => Promise<{ items: GitLabWorkItem[]; error?: ClassifiedError }>
     createIssue: (args: {
       repoPath: string
       title: string

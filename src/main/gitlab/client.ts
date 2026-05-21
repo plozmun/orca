@@ -33,6 +33,25 @@ function encodedProject(projectPath: string): string {
   return encodeURIComponent(projectPath)
 }
 
+function projectRefToGlabRepo(projectRef: ProjectRef): string {
+  // Why: `glab mr list` otherwise infers from cwd and can ignore an
+  // upstream/origin preference. A full URL also works for self-hosted hosts.
+  return `https://${projectRef.host}/${projectRef.path}`
+}
+
+function mrListStateFlags(state: MRListState): string[] {
+  switch (state) {
+    case 'opened':
+      return []
+    case 'merged':
+      return ['--merged']
+    case 'closed':
+      return ['--closed']
+    case 'all':
+      return ['--all']
+  }
+}
+
 /**
  * Get the authenticated GitLab viewer. Mirrors getAuthenticatedViewer
  * from the GitHub client — returns null when glab is unavailable, the
@@ -160,9 +179,8 @@ export async function getMergeRequestForBranch(
 }
 
 /**
- * List merge requests for a project with strict pagination. Returns
- * total counts pulled from X-Total / X-Total-Pages response headers so
- * callers can render "Page X of Y" UIs.
+ * List merge requests for a project. Uses glab CLI pagination because
+ * it handles self-hosted auth and project selection consistently.
  */
 export async function listMergeRequests(
   repoPath: string,
@@ -178,12 +196,9 @@ export async function listMergeRequests(
   try {
     if (projectRef) {
       // Why: use `glab mr list` (CLI) instead of the REST API directly.
-      // The CLI infers the project from cwd and respects the user's glab
-      // auth configuration (including self-hosted hosts), which is more
-      // reliable than manually constructing REST paths that may target
-      // the wrong host or project encoding.
-      // glab mr list flags: default=opened, --closed, --merged, --all
-      const stateFlag = state === 'all' ? [] : state === 'opened' ? [] : [`--${state}`]
+      // The CLI respects the user's glab auth configuration; `--repo`
+      // keeps upstream/origin preference resolution explicit.
+      const stateFlag = mrListStateFlags(state)
       const { stdout } = await glabExecFileAsync(
         [
           'mr',
@@ -194,6 +209,12 @@ export async function listMergeRequests(
           String(perPage),
           '--page',
           String(page),
+          '--order',
+          'updated_at',
+          '--sort',
+          'desc',
+          '--repo',
+          projectRefToGlabRepo(projectRef),
           ...stateFlag
         ],
         { cwd: repoPath }
@@ -214,7 +235,7 @@ export async function listMergeRequests(
     // the repo's remote host is not in getGlabKnownHosts() (e.g. a fresh
     // self-hosted instance), but glab itself can still resolve it from the
     // local git config.
-    const stateFlag = state === 'all' ? [] : state === 'opened' ? [] : [`--${state}`]
+    const stateFlag = mrListStateFlags(state)
     const { stdout } = await glabExecFileAsync(
       [
         'mr',
@@ -225,6 +246,10 @@ export async function listMergeRequests(
         String(perPage),
         '--page',
         String(page),
+        '--order',
+        'updated_at',
+        '--sort',
+        'desc',
         ...stateFlag
       ],
       { cwd: repoPath }

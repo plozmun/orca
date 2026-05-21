@@ -10,7 +10,8 @@ import {
   CLIENT_PLATFORM,
   getLinkedWorkItemSuggestedName,
   getSetupConfig,
-  getWorkspaceSeedName
+  getWorkspaceSeedName,
+  isGitLabIssueUrl
 } from '@/lib/new-workspace'
 import { ensureHooksConfirmed } from '@/lib/ensure-hooks-confirmed'
 import { checkRuntimeHooks } from '@/runtime/runtime-hooks-client'
@@ -265,9 +266,7 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
       undefined,
       undefined,
       item.type === 'mr' && item.number ? item.number : undefined,
-      item.type === 'issue' && item.number && item.url.includes('gitlab.com')
-        ? item.number
-        : undefined
+      item.type === 'issue' && item.number && isGitLabIssueUrl(item.url) ? item.number : undefined
     )
     worktreeId = result.worktree.id
     const worktreePath = result.worktree.path
