@@ -218,6 +218,21 @@ export async function listMergeRequests(
     connectionId
   )
   if (!projectRef) {
+    if (connectionId) {
+      // Why: SSH-backed repos have no local cwd for glab to infer from.
+      // Running cwd-less could resolve an unrelated local project instead.
+      return {
+        items: [],
+        page,
+        perPage,
+        totalCount: 0,
+        totalPages: 0,
+        error: {
+          type: 'not_found',
+          message: 'No GitLab project found for this repository.'
+        }
+      }
+    }
     // Why: fallback — let glab infer project from cwd, same as listIssues.
     // Used when the repo's remote host is not in getGlabKnownHosts()
     // (e.g. a fresh self-hosted instance), but glab itself can still

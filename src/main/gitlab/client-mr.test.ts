@@ -336,6 +336,26 @@ describe('gitlab client — MR operations', () => {
       expect(glabApiWithHeadersMock).not.toHaveBeenCalled()
     })
 
+    it('does not run the cwd fallback for unresolved SSH repos', async () => {
+      resolveIssueSourceMock.mockResolvedValueOnce({
+        source: null,
+        fellBack: false
+      })
+      const result = await listMergeRequests(
+        '/remote/repo',
+        'opened',
+        1,
+        20,
+        undefined,
+        undefined,
+        'conn-1'
+      )
+      expect(result.error?.type).toBe('not_found')
+      expect(result.items).toEqual([])
+      expect(glabExecFileAsyncMock).not.toHaveBeenCalled()
+      expect(glabApiWithHeadersMock).not.toHaveBeenCalled()
+    })
+
     it('classifies API errors into the result envelope', async () => {
       glabApiWithHeadersMock.mockRejectedValueOnce(new Error('HTTP 403 Forbidden'))
       const result = await listMergeRequests('/repo', 'opened')
