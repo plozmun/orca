@@ -34,15 +34,6 @@ function stripRefPrefix(ref: string): string {
   return normalizeHostedReviewHeadRef(ref)
 }
 
-function branchToTitle(branch: string): string {
-  const lastSegment = branch.split('/').filter(Boolean).at(-1) ?? branch
-  return lastSegment
-    .replace(/[-_]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, (char) => char.toUpperCase())
-}
-
 async function detectHostedReviewProvider(
   repoPath: string,
   connectionId?: string | null
@@ -100,44 +91,6 @@ async function runGitForHostedReview(
   return gitExecFileAsync(args, { cwd: repoPath })
 }
 
-async function getLatestCommitSubject(
-  repoPath: string,
-  connectionId?: string | null
-): Promise<string | null> {
-  try {
-    const { stdout } = await runGitForHostedReview(
-      repoPath,
-      ['log', '-1', '--pretty=%s'],
-      connectionId
-    )
-    const subject = stdout.trim()
-    return subject || null
-  } catch {
-    return null
-  }
-}
-
-async function getCommitSummaryBody(
-  repoPath: string,
-  base: string | null,
-  connectionId?: string | null
-): Promise<string | null> {
-  if (!base) {
-    return null
-  }
-  try {
-    const { stdout } = await runGitForHostedReview(
-      repoPath,
-      ['log', '--pretty=format:- %s', '--max-count=20', `${base}..HEAD`],
-      connectionId
-    )
-    const body = stdout.trim()
-    return body || null
-  } catch {
-    return null
-  }
-}
-
 async function getDefaultBaseRef(
   repoPath: string,
   connectionId?: string | null
@@ -159,12 +112,15 @@ async function hasUncommittedChanges(
   connectionId?: string | null
 ): Promise<boolean> {
   if (connectionId) {
-    const { stdout } = await runGitForHostedReview(
-      repoPath,
-      ['status', '--porcelain'],
-      connectionId
-    )
-    return stdout.trim().length > 0
+    const provider = getSshGitProvider(connectionId)
+    if (!provider) {
+      throw new Error(
+        'Remote connection dropped. Click Reconnect on the SSH target before retrying.'
+      )
+    }
+    // Why: the relay intentionally restricts generic git.exec. Use the
+    // structured status RPC for SSH dirty checks instead of raw `git status`.
+    return (await provider.getStatus(repoPath)).entries.length > 0
   }
   const { stdout } = await gitExecFileAsync(['status', '--porcelain'], {
     cwd: repoPath,
@@ -182,32 +138,14 @@ async function getHostedReviewUpstreamStatus(
   if (!connectionId) {
     return getUpstreamStatus(repoPath)
   }
+  const provider = getSshGitProvider(connectionId)
+  if (!provider) {
+    throw new Error('Remote connection dropped. Click Reconnect on the SSH target before retrying.')
+  }
   try {
-    const { stdout: upstreamStdout } = await runGitForHostedReview(
-      repoPath,
-      ['rev-parse', '--abbrev-ref', 'HEAD@{u}'],
-      connectionId
-    )
-    const upstreamName = upstreamStdout.trim()
-    if (!upstreamName) {
-      return { hasUpstream: false, ahead: 0, behind: 0 }
-    }
-
-    const { stdout: countsStdout } = await runGitForHostedReview(
-      repoPath,
-      ['rev-list', '--left-right', '--count', 'HEAD...@{u}'],
-      connectionId
-    )
-    const tokens = countsStdout.trim().split(/\s+/)
-    if (tokens.length !== 2) {
-      throw new Error(`Unexpected git rev-list output: ${JSON.stringify(countsStdout)}`)
-    }
-    const ahead = Number.parseInt(tokens[0]!, 10)
-    const behind = Number.parseInt(tokens[1]!, 10)
-    if (!Number.isFinite(ahead) || !Number.isFinite(behind) || ahead < 0 || behind < 0) {
-      throw new Error(`Unparseable git rev-list counts: ${JSON.stringify(countsStdout)}`)
-    }
-    return { hasUpstream: true, upstreamName, ahead, behind }
+    // Why: SSH exposes upstream divergence through a dedicated relay RPC;
+    // generic git.exec intentionally does not allow rev-list/status plumbing.
+    return await provider.getUpstreamStatus(repoPath)
   } catch (error) {
     if (isNoUpstreamError(error)) {
       return { hasUpstream: false, ahead: 0, behind: 0 }
@@ -355,16 +293,11 @@ export async function getHostedReviewCreationEligibility(
     connectionId: args.connectionId ?? null
   })
 
-  const title =
-    (await getLatestCommitSubject(args.repoPath, args.connectionId)) ?? branchToTitle(branch)
-  const body = await getCommitSummaryBody(args.repoPath, defaultBaseRef ?? null, args.connectionId)
   const baseResult = {
     provider,
     review: review ? { number: review.number, url: review.url } : null,
     defaultBaseRef,
-    head: branch || null,
-    title,
-    body
+    head: branch || null
   }
 
   if (!branch || branch === 'HEAD') {

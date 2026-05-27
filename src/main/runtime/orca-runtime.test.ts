@@ -1,7 +1,9 @@
 /* eslint-disable max-lines -- Why: runtime behavior is stateful and cross-cutting, so these tests stay in one file to preserve the end-to-end invariants around handles, waits, and graph sync. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'events'
-import { mkdtemp, rm } from 'fs/promises'
+import { lstat, mkdir, mkdtemp, rm, writeFile } from 'fs/promises'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import type { WorktreeLineage, WorktreeMeta } from '../../shared/types'
 import {
   addWorktree,
@@ -48,9 +50,12 @@ const {
   createHostedReviewMock,
   getHostedReviewCreationEligibilityMock,
   getPRForBranchMock,
+  listGitHubIssuesMock,
   detectInstalledAgentsMock,
   detectRemoteAgentsMock,
+  listGitLabMergeRequestsMock,
   listGitLabWorkItemsMock,
+  listGitLabIssuesMock,
   listGitLabTodosMock,
   getGitLabProjectRefForRemoteMock,
   getGitLabWorkItemByProjectRefMock,
@@ -63,7 +68,8 @@ const {
   reopenGitLabMRMock,
   getGlabKnownHostsMock,
   getGitLabWorkItemDetailsMock,
-  getIssueMock
+  getIssueMock,
+  deleteWorktreeHistoryDirMock
 } = vi.hoisted(() => {
   // Why: SSH runtime tests register providers through the public dispatcher API,
   // so the mock needs the same registry semantics as the real module.
@@ -97,9 +103,12 @@ const {
     createHostedReviewMock: vi.fn(),
     getHostedReviewCreationEligibilityMock: vi.fn(),
     getPRForBranchMock: vi.fn().mockResolvedValue(null),
+    listGitHubIssuesMock: vi.fn(),
     detectInstalledAgentsMock: vi.fn(),
     detectRemoteAgentsMock: vi.fn(),
+    listGitLabMergeRequestsMock: vi.fn(),
     listGitLabWorkItemsMock: vi.fn(),
+    listGitLabIssuesMock: vi.fn(),
     listGitLabTodosMock: vi.fn(),
     getGitLabProjectRefForRemoteMock: vi.fn(),
     getGitLabWorkItemByProjectRefMock: vi.fn(),
@@ -112,7 +121,8 @@ const {
     reopenGitLabMRMock: vi.fn(),
     getGlabKnownHostsMock: vi.fn(),
     getGitLabWorkItemDetailsMock: vi.fn(),
-    getIssueMock: vi.fn()
+    getIssueMock: vi.fn(),
+    deleteWorktreeHistoryDirMock: vi.fn()
   }
 })
 
@@ -121,6 +131,10 @@ vi.mock('../git/worktree', () => ({
   assertWorktreeCleanForRemoval: vi.fn().mockResolvedValue(undefined),
   addWorktree: addWorktreeMock,
   removeWorktree: removeWorktreeMock
+}))
+
+vi.mock('../terminal-history', () => ({
+  deleteWorktreeHistoryDir: deleteWorktreeHistoryDirMock
 }))
 
 vi.mock('../providers/ssh-git-dispatch', () => ({
@@ -193,7 +207,8 @@ vi.mock('../github/client', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>
   return {
     ...actual,
-    getPRForBranch: getPRForBranchMock
+    getPRForBranch: getPRForBranchMock,
+    listIssues: listGitHubIssuesMock
   }
 })
 
@@ -201,7 +216,9 @@ vi.mock('../gitlab/client', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>
   return {
     ...actual,
+    listMergeRequests: listGitLabMergeRequestsMock,
     listWorkItems: listGitLabWorkItemsMock,
+    listIssues: listGitLabIssuesMock,
     listTodos: listGitLabTodosMock,
     getProjectRefForRemote: getGitLabProjectRefForRemoteMock,
     getWorkItemByProjectRef: getGitLabWorkItemByProjectRefMock,
@@ -316,12 +333,18 @@ afterEach(() => {
   })
   getPRForBranchMock.mockReset()
   getPRForBranchMock.mockResolvedValue(null)
+  listGitHubIssuesMock.mockReset()
+  listGitHubIssuesMock.mockResolvedValue({ items: [] })
   detectInstalledAgentsMock.mockReset()
   detectInstalledAgentsMock.mockResolvedValue([])
   detectRemoteAgentsMock.mockReset()
   detectRemoteAgentsMock.mockResolvedValue([])
+  listGitLabMergeRequestsMock.mockReset()
+  listGitLabMergeRequestsMock.mockResolvedValue({ items: [] })
   listGitLabWorkItemsMock.mockReset()
   listGitLabWorkItemsMock.mockResolvedValue({ items: [] })
+  listGitLabIssuesMock.mockReset()
+  listGitLabIssuesMock.mockResolvedValue({ items: [] })
   listGitLabTodosMock.mockReset()
   listGitLabTodosMock.mockResolvedValue([])
   getGitLabProjectRefForRemoteMock.mockReset()
@@ -499,6 +522,29 @@ function deferred<T>(): {
     reject = rej
   })
   return { promise, resolve, reject }
+}
+
+function createStaleRuntimeWorktreeStore(
+  worktreeId: string,
+  metaOverrides: Partial<WorktreeMeta> = {}
+) {
+  const metaById: Record<string, WorktreeMeta> = {
+    [worktreeId]: makeWorktreeMeta(metaOverrides)
+  }
+  const removeWorktreeMeta = vi.fn((id: string) => {
+    delete metaById[id]
+  })
+  const runtimeStore = {
+    ...store,
+    getAllWorktreeMeta: () => metaById,
+    getWorktreeMeta: (id: string) => metaById[id],
+    setWorktreeMeta: (id: string, meta: Partial<WorktreeMeta>) => {
+      metaById[id] = { ...(metaById[id] ?? makeWorktreeMeta()), ...meta }
+      return metaById[id]
+    },
+    removeWorktreeMeta
+  }
+  return { runtimeStore, removeWorktreeMeta }
 }
 
 const store = {
@@ -878,6 +924,102 @@ describe('OrcaRuntimeService', () => {
       id: result.worktree.id,
       path: createdWorktree.path
     })
+  })
+
+  it('creates additional workspace metadata for folder-mode repos through runtime create', async () => {
+    const folderRepo = {
+      id: 'folder-repo',
+      path: '/workspace/folder',
+      displayName: 'Folder',
+      badgeColor: 'blue',
+      addedAt: 1,
+      kind: 'folder' as const
+    }
+    const metaById: Record<string, WorktreeMeta> = {}
+    const runtimeStore = {
+      ...store,
+      getRepos: () => [folderRepo],
+      getRepo: (id: string) => (id === folderRepo.id ? folderRepo : undefined),
+      getAllWorktreeMeta: () => metaById,
+      getWorktreeMeta: (worktreeId: string) => metaById[worktreeId],
+      setWorktreeMeta: (worktreeId: string, meta: Partial<WorktreeMeta>) => {
+        metaById[worktreeId] = { ...(metaById[worktreeId] ?? makeWorktreeMeta()), ...meta }
+        return metaById[worktreeId]
+      },
+      removeWorktreeMeta: (worktreeId: string) => {
+        delete metaById[worktreeId]
+      }
+    }
+    let deletedWorktreeId = ''
+    const localProvider = {
+      listProcesses: vi.fn(async () => [{ id: `${deletedWorktreeId}@@pty-1` }]),
+      shutdown: vi.fn(async () => undefined)
+    }
+    const runtime = new OrcaRuntimeService(runtimeStore as never, undefined, {
+      getLocalProvider: () => localProvider as never
+    })
+    const notifier = { worktreesChanged: vi.fn() }
+    runtime.setNotifier(notifier as never)
+
+    const result = await runtime.createManagedWorktree({
+      repoSelector: 'id:folder-repo',
+      name: 'folder-session',
+      createdWithAgent: 'codex'
+    })
+
+    expect(addWorktreeMock).not.toHaveBeenCalled()
+    expect(result.worktree).toEqual(
+      expect.objectContaining({
+        id: expect.stringMatching(/^folder-repo::\/workspace\/folder::workspace:[0-9a-f-]{36}$/),
+        repoId: 'folder-repo',
+        path: '/workspace/folder',
+        displayName: 'folder-session',
+        isMainWorktree: false,
+        createdWithAgent: 'codex'
+      })
+    )
+    expect(metaById[result.worktree.id]).toMatchObject({
+      instanceId: result.worktree.instanceId,
+      displayName: 'folder-session',
+      orcaCreationSource: 'runtime',
+      createdWithAgent: 'codex'
+    })
+    await expect(runtime.showManagedWorktree(`id:${result.worktree.id}`)).resolves.toMatchObject({
+      id: result.worktree.id,
+      repoId: 'folder-repo',
+      path: '/workspace/folder',
+      displayName: 'folder-session'
+    })
+    await expect(runtime.listManagedWorktrees('id:folder-repo')).resolves.toMatchObject({
+      totalCount: 2,
+      worktrees: [
+        expect.objectContaining({
+          id: 'folder-repo::/workspace/folder',
+          isMainWorktree: true
+        }),
+        expect.objectContaining({
+          id: result.worktree.id,
+          isMainWorktree: false
+        })
+      ]
+    })
+    await expect(
+      runtime.updateManagedWorktreeMeta(`id:${result.worktree.id}`, { comment: 'note' })
+    ).resolves.toMatchObject({
+      id: result.worktree.id,
+      comment: 'note'
+    })
+    await expect(
+      runtime.removeManagedWorktree('id:folder-repo::/workspace/folder')
+    ).rejects.toThrow('Cannot delete the project root workspace')
+    deletedWorktreeId = result.worktree.id
+    await expect(runtime.removeManagedWorktree(`id:${result.worktree.id}`)).resolves.toEqual({})
+    expect(localProvider.shutdown).toHaveBeenCalledWith(`${result.worktree.id}@@pty-1`, {
+      immediate: true
+    })
+    expect(metaById[result.worktree.id]).toBeUndefined()
+    expect(deleteWorktreeHistoryDirMock).toHaveBeenCalledWith(result.worktree.id)
+    expect(notifier.worktreesChanged).toHaveBeenCalledWith('folder-repo')
   })
 
   it('refreshes runtime remote-tracking bases before creating local worktrees', async () => {
@@ -1349,6 +1491,7 @@ describe('OrcaRuntimeService', () => {
     expect(gitProvider.removeWorktree).toHaveBeenCalledWith('/remote/feature', true)
     expect(removeWorktree).not.toHaveBeenCalled()
     expect(listWorktrees).not.toHaveBeenCalled()
+    expect(deleteWorktreeHistoryDirMock).toHaveBeenCalledWith(`${TEST_REPO_ID}::/remote/feature`)
   })
 
   it('rejects SSH-backed runtime removal of the main worktree before provider deletion', async () => {
@@ -1596,6 +1739,9 @@ describe('OrcaRuntimeService', () => {
 
   it('allows host integration slug helpers for SSH repos through provider-aware GitHub clients', async () => {
     getIssueMock.mockResolvedValueOnce({ number: 12, title: 'Remote issue' })
+    listGitHubIssuesMock.mockResolvedValueOnce({
+      items: [{ number: 7, title: 'Remote issue list item' }]
+    })
     const remoteStore = {
       ...store,
       getRepos: () => [
@@ -1616,7 +1762,11 @@ describe('OrcaRuntimeService', () => {
       number: 12,
       title: 'Remote issue'
     })
+    await expect(runtime.listRepoIssues('id:repo-1', 10)).resolves.toEqual([
+      { number: 7, title: 'Remote issue list item' }
+    ])
     expect(getIssueMock).toHaveBeenCalledWith('/remote/repo', 12, 'ssh-1')
+    expect(listGitHubIssuesMock).toHaveBeenCalledWith('/remote/repo', 10, undefined, 'ssh-1')
   })
 
   it('rejects hosted review worktree selectors outside the selected repo', async () => {
@@ -1895,7 +2045,14 @@ describe('OrcaRuntimeService', () => {
     try {
       const repo = await runtime.cloneRepo('https://example.com/repo-badge-color.git', '/tmp')
       expect(repo.badgeColor).toBe(DEFAULT_REPO_BADGE_COLOR)
-      expect(added).toEqual([expect.objectContaining({ badgeColor: DEFAULT_REPO_BADGE_COLOR })])
+      expect(added).toEqual([
+        expect.objectContaining({
+          badgeColor: DEFAULT_REPO_BADGE_COLOR,
+          externalWorktreeVisibility: 'hide',
+          externalWorktreeVisibilityLegacy: false
+        })
+      ])
+      expect(repo.externalWorktreeVisibility).toBe('hide')
     } finally {
       spawnSpy.mockRestore()
     }
@@ -3302,7 +3459,52 @@ describe('OrcaRuntimeService', () => {
     expect(futureCursorRead.limited).toBe(false)
   })
 
-  it('bounds preview reads by characters for long partial terminal output', async () => {
+  // Why: PR #2553 fixed Orca CLI terminal reads so older retained output stays
+  // reachable by cursor; this guards that pagination without allowing previews
+  // to regress into full-transcript RPC payloads.
+  it('keeps terminal read payloads bounded while retained output remains pageable', async () => {
+    const runtime = new OrcaRuntimeService(store)
+    syncSinglePty(runtime)
+
+    const [terminal] = (await runtime.listTerminals()).terminals
+    const linePayload = 'x'.repeat(24)
+    const lines = Array.from(
+      { length: 2000 },
+      (_, index) => `line-${index.toString().padStart(4, '0')}-${linePayload}`
+    )
+    runtime.onPtyData('pty-1', `${lines.join('\n')}\n`, 100)
+
+    const preview = await runtime.readTerminal(terminal.handle)
+    expect(Buffer.byteLength(JSON.stringify(preview), 'utf8')).toBeLessThan(10_000)
+    expect(preview.tail).toHaveLength(120)
+    expect(preview.tail[0]).toBe(lines.at(-120))
+    expect(preview.limited).toBe(true)
+    expect(preview.oldestCursor).toBe('0')
+    expect(preview.nextCursor).toBe('2000')
+    expect(preview.latestCursor).toBe('2000')
+
+    const collected: string[] = []
+    let cursor = Number(preview.oldestCursor)
+    const latestCursor = Number(preview.latestCursor)
+    for (let pageIndex = 0; cursor < latestCursor; pageIndex += 1) {
+      expect(pageIndex).toBeLessThan(10)
+      const page = await runtime.readTerminal(terminal.handle, { cursor, limit: 333 })
+      expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThan(16_000)
+      expect(page.tail.length).toBeGreaterThan(0)
+      expect(page.tail.length).toBeLessThanOrEqual(333)
+      expect(page.returnedLineCount).toBe(page.tail.length)
+
+      collected.push(...page.tail)
+      const nextCursor = Number(page.nextCursor)
+      expect(nextCursor).toBeGreaterThan(cursor)
+      cursor = nextCursor
+    }
+
+    expect(collected).toHaveLength(lines.length)
+    expect(collected.findIndex((line, index) => line !== lines[index])).toBe(-1)
+  })
+
+  it('bounds retained partial terminal output before preview reads', async () => {
     const runtime = new OrcaRuntimeService(store)
 
     runtime.attachWindow(1)
@@ -3328,16 +3530,43 @@ describe('OrcaRuntimeService', () => {
     })
 
     const [terminal] = (await runtime.listTerminals()).terminals
-    const longPartialLine = `${'x'.repeat(40_000)}tail-marker`
-    runtime.onPtyData('pty-1', longPartialLine, 100)
+    runtime.onPtyData(
+      'pty-1',
+      `${Array.from({ length: 2000 }, (_, index) => `line-${index}`).join('\n')}\n`,
+      99
+    )
+    runtime.onPtyData('pty-1', `${'x'.repeat(40_000)}tail-marker-0`, 100)
+    type RetainedTailState = {
+      tailBuffer: string[]
+      tailPartialLine: string
+      tailTruncated: boolean
+    }
+    const cappedPartialState = (
+      runtime as unknown as {
+        ptysById: Map<string, RetainedTailState>
+      }
+    ).ptysById.get('pty-1')
+    const retainedLineBuffer = cappedPartialState?.tailBuffer
+    for (let index = 1; index < 5; index += 1) {
+      runtime.onPtyData('pty-1', `${'x'.repeat(40_000)}tail-marker-${index}`, 100 + index)
+    }
+
+    const retained = (
+      runtime as unknown as {
+        ptysById: Map<string, RetainedTailState>
+      }
+    ).ptysById.get('pty-1')
+    expect(retained?.tailBuffer).toBe(retainedLineBuffer)
+    expect(retained?.tailPartialLine).toHaveLength(4000)
+    expect(retained?.tailPartialLine.endsWith('tail-marker-4')).toBe(true)
+    expect(retained?.tailTruncated).toBe(true)
 
     const preview = await runtime.readTerminal(terminal.handle)
-    expect(preview.tail).toHaveLength(1)
-    expect(preview.tail[0]).toHaveLength(32 * 1024)
-    expect(preview.tail[0].endsWith('tail-marker')).toBe(true)
-    expect(preview.limited).toBe(true)
+    expect(preview.tail).toHaveLength(120)
+    expect(preview.tail.at(-1)).toHaveLength(4000)
+    expect(preview.tail.at(-1)?.endsWith('tail-marker-4')).toBe(true)
     expect(preview.truncated).toBe(true)
-    expect(preview.nextCursor).toBe('0')
+    expect(preview.nextCursor).toBe('2000')
   })
 
   it('delivers pending orchestration messages to an already-idle agent', async () => {
@@ -5310,6 +5539,32 @@ describe('OrcaRuntimeService', () => {
     )
   })
 
+  it('strips Orca provenance fields from runtime metadata updates', async () => {
+    const metaById: Record<string, WorktreeMeta> = {
+      [TEST_WORKTREE_ID]: makeWorktreeMeta({ instanceId: 'child-instance' })
+    }
+    const setWorktreeMeta = vi.fn((worktreeId: string, meta: Partial<WorktreeMeta>) => {
+      metaById[worktreeId] = { ...metaById[worktreeId], ...meta }
+      return metaById[worktreeId]
+    })
+    const runtimeStore = {
+      ...store,
+      getAllWorktreeMeta: () => metaById,
+      getWorktreeMeta: (worktreeId: string) => metaById[worktreeId],
+      setWorktreeMeta
+    }
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+
+    await runtime.updateManagedWorktreeMeta(`id:${TEST_WORKTREE_ID}`, {
+      comment: 'keep me',
+      orcaCreatedAt: 123,
+      orcaCreationSource: 'runtime',
+      orcaCreationWorkspaceLayout: { path: '/tmp', nestWorkspaces: false }
+    })
+
+    expect(setWorktreeMeta).toHaveBeenCalledWith(TEST_WORKTREE_ID, { comment: 'keep me' })
+  })
+
   it('ignores stale instance-mismatched lineage when validating manual cycle repairs', async () => {
     const parentPath = '/tmp/worktree-a'
     const childPath = '/tmp/worktree-b'
@@ -5558,6 +5813,26 @@ describe('OrcaRuntimeService', () => {
     expect(runtimeStore.setWorktreeMeta).not.toHaveBeenCalled()
     expect(lineageById[childId]).toBeTruthy()
     expect(metaById[parentId].instanceId).toBe('parent-instance')
+  })
+
+  it('returns a non-authoritative detected list when a runtime local worktree scan fails', async () => {
+    const removeWorktreeLineage = vi.fn()
+    const runtimeStore = {
+      ...store,
+      getAllWorktreeLineage: () => ({}),
+      removeWorktreeLineage
+    }
+    vi.mocked(listWorktrees).mockRejectedValueOnce(new Error('git unavailable'))
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+
+    await expect(runtime.listDetectedManagedWorktrees(`id:${TEST_REPO_ID}`)).resolves.toEqual({
+      repoId: TEST_REPO_ID,
+      authoritative: false,
+      source: 'metadata-fallback',
+      worktrees: []
+    })
+
+    expect(removeWorktreeLineage).not.toHaveBeenCalled()
   })
 
   it('does not prune lineage when an SSH runtime provider is unavailable', async () => {
@@ -7178,8 +7453,27 @@ describe('OrcaRuntimeService', () => {
   })
 
   it('passes SSH connection ids through GitLab task operations', async () => {
+    listGitLabMergeRequestsMock.mockResolvedValue({ items: [] })
     listGitLabWorkItemsMock.mockResolvedValue({ items: [] })
+    listGitLabIssuesMock.mockResolvedValue({
+      items: [
+        {
+          number: 7,
+          title: 'Issue title',
+          state: 'opened',
+          url: 'https://gitlab.example/issues/7',
+          labels: ['bug'],
+          updatedAt: '2026-05-22T00:00:00Z',
+          author: 'alex'
+        }
+      ]
+    })
     listGitLabTodosMock.mockResolvedValue([])
+    getGitLabWorkItemByProjectRefMock.mockResolvedValue({
+      id: 'gitlab-issue-7',
+      type: 'issue',
+      number: 7
+    })
     createGitLabIssueMock.mockResolvedValue({
       ok: true,
       number: 1,
@@ -7209,7 +7503,9 @@ describe('OrcaRuntimeService', () => {
     }
     const runtime = new OrcaRuntimeService(runtimeStore as never)
 
+    await runtime.listGitLabRepoMRs(TEST_REPO_ID, 'closed', 2, 25, 'ambiguous selector')
     await runtime.listGitLabRepoWorkItems(TEST_REPO_ID, 'closed', 2, 25, 'ambiguous selector')
+    const issues = await runtime.listGitLabRepoIssues(TEST_REPO_ID, 'opened', '@me', 50)
     await runtime.listGitLabRepoTodos(TEST_REPO_ID)
     await runtime.createGitLabRepoIssue(TEST_REPO_ID, 'New issue', 'Body')
     await runtime.updateGitLabRepoIssue(TEST_REPO_ID, 7, { state: 'closed' })
@@ -7219,7 +7515,22 @@ describe('OrcaRuntimeService', () => {
     await runtime.updateGitLabRepoMRState(TEST_REPO_ID, 8, 'closed')
     await runtime.updateGitLabRepoMRState(TEST_REPO_ID, 8, 'opened')
     await runtime.getGitLabRepoWorkItemDetails(TEST_REPO_ID, 8, 'mr')
+    await runtime.getGitLabRepoWorkItemByPath(
+      TEST_REPO_ID,
+      { host: 'gitlab.example.com', path: 'group/project' },
+      7,
+      'issue'
+    )
 
+    expect(listGitLabMergeRequestsMock).toHaveBeenCalledWith(
+      '/remote/repo',
+      'closed',
+      2,
+      25,
+      'origin',
+      'ambiguous selector',
+      'ssh-1'
+    )
     expect(listGitLabWorkItemsMock).toHaveBeenCalledWith(
       '/remote/repo',
       'closed',
@@ -7229,6 +7540,28 @@ describe('OrcaRuntimeService', () => {
       'ambiguous selector',
       'ssh-1'
     )
+    expect(listGitLabIssuesMock).toHaveBeenCalledWith(
+      '/remote/repo',
+      50,
+      'origin',
+      'opened',
+      '@me',
+      'ssh-1'
+    )
+    expect(issues.items).toEqual([
+      {
+        id: `gitlab-issue-${TEST_REPO_ID}-7`,
+        type: 'issue',
+        number: 7,
+        title: 'Issue title',
+        state: 'opened',
+        url: 'https://gitlab.example/issues/7',
+        labels: ['bug'],
+        updatedAt: '2026-05-22T00:00:00Z',
+        author: 'alex',
+        repoId: TEST_REPO_ID
+      }
+    ])
     expect(listGitLabTodosMock).toHaveBeenCalledWith('/remote/repo', 'ssh-1')
     expect(createGitLabIssueMock).toHaveBeenCalledWith(
       '/remote/repo',
@@ -7279,6 +7612,104 @@ describe('OrcaRuntimeService', () => {
       'ssh-1',
       undefined
     )
+    expect(getGitLabWorkItemByProjectRefMock).toHaveBeenCalledWith(
+      '/remote/repo',
+      { host: 'gitlab.example.com', path: 'group/project' },
+      7,
+      'issue',
+      'ssh-1'
+    )
+  })
+
+  it('normalizes runtime GitLab issue list arguments like the desktop IPC path', async () => {
+    const runtime = new OrcaRuntimeService(store as never)
+
+    await runtime.listGitLabRepoIssues(TEST_REPO_ID, 'closed', 'someone-else' as never, 250.8)
+    await runtime.listGitLabRepoIssues(TEST_REPO_ID, 'all', '@me', 0.7)
+    await runtime.listGitLabRepoIssues(TEST_REPO_ID, 'unexpected' as never, '@me', Number.NaN)
+
+    expect(listGitLabIssuesMock).toHaveBeenNthCalledWith(
+      1,
+      TEST_REPO_PATH,
+      100,
+      undefined,
+      'closed',
+      undefined,
+      null
+    )
+    expect(listGitLabIssuesMock).toHaveBeenNthCalledWith(
+      2,
+      TEST_REPO_PATH,
+      1,
+      undefined,
+      'all',
+      '@me',
+      null
+    )
+    expect(listGitLabIssuesMock).toHaveBeenNthCalledWith(
+      3,
+      TEST_REPO_PATH,
+      20,
+      undefined,
+      'opened',
+      '@me',
+      null
+    )
+  })
+
+  it('records GitLab pasted-project recents only after successful runtime lookup', async () => {
+    let settings = {
+      ...store.getSettings(),
+      gitlabProjects: {
+        pinned: [{ host: 'gitlab.example.com', path: 'group/pinned' }],
+        recent: []
+      }
+    }
+    const updateSettings = vi.fn((updates: Record<string, unknown>) => {
+      settings = { ...settings, ...updates } as typeof settings
+    })
+    const runtimeStore = {
+      ...store,
+      getSettings: () => settings,
+      updateSettings
+    }
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+
+    getGitLabWorkItemByProjectRefMock.mockResolvedValueOnce({
+      id: 'gitlab-issue-7',
+      type: 'issue',
+      number: 7
+    })
+    await runtime.getGitLabRepoWorkItemByPath(
+      TEST_REPO_ID,
+      { host: 'gitlab.example.com', path: 'group/project' },
+      7,
+      'issue'
+    )
+
+    expect(updateSettings).toHaveBeenCalledWith({
+      gitlabProjects: {
+        pinned: [{ host: 'gitlab.example.com', path: 'group/pinned' }],
+        recent: [
+          expect.objectContaining({
+            host: 'gitlab.example.com',
+            path: 'group/project',
+            lastOpenedAt: expect.any(String)
+          })
+        ]
+      }
+    })
+
+    updateSettings.mockClear()
+    getGitLabWorkItemByProjectRefMock.mockResolvedValueOnce(null)
+    await runtime.getGitLabRepoWorkItemByPath(
+      TEST_REPO_ID,
+      { host: 'gitlab.example.com', path: 'group/missing' },
+      404,
+      'issue'
+    )
+
+    expect(updateSettings).not.toHaveBeenCalled()
   })
 
   it('resolves local GitLab fork MR bases from the target project MR head ref', async () => {
@@ -7453,6 +7884,45 @@ describe('OrcaRuntimeService', () => {
     }
   })
 
+  it('resolves an exact path selector when duplicate repo entries expose the same path', async () => {
+    const runtime = new OrcaRuntimeService(store)
+    const duplicatePath = '/tmp/workspaces/runtime-duplicate-selector'
+    const getRepos = vi.spyOn(store, 'getRepos').mockReturnValue([
+      {
+        id: TEST_REPO_ID,
+        path: TEST_REPO_PATH,
+        displayName: 'repo',
+        badgeColor: 'blue',
+        addedAt: 1
+      },
+      {
+        id: 'repo-duplicate-entry',
+        path: '/tmp/repo-secondary-worktree',
+        displayName: 'repo-secondary-worktree',
+        badgeColor: 'red',
+        addedAt: 2
+      }
+    ])
+    vi.mocked(listWorktrees).mockResolvedValue([
+      {
+        path: duplicatePath,
+        head: 'def',
+        branch: 'runtime-duplicate-selector',
+        isBare: false,
+        isMainWorktree: false
+      }
+    ])
+
+    try {
+      const worktree = await runtime.showManagedWorktree(`path:${duplicatePath}`)
+
+      expect(worktree.id).toBe(`${TEST_REPO_ID}::${duplicatePath}`)
+      expect(worktree.path).toBe(duplicatePath)
+    } finally {
+      getRepos.mockRestore()
+    }
+  })
+
   it('keeps CLI-created worktrees successful when initial terminal creation fails', async () => {
     const runtime = new OrcaRuntimeService(store)
     const spawn = vi.fn().mockRejectedValue(new Error('pty unavailable'))
@@ -7614,9 +8084,210 @@ describe('OrcaRuntimeService', () => {
 
     expect(runHook).not.toHaveBeenCalled()
     expect(removeWorktree).toHaveBeenCalledWith(TEST_REPO_PATH, TEST_WORKTREE_PATH, false)
+    expect(deleteWorktreeHistoryDirMock).toHaveBeenCalledWith(TEST_WORKTREE_ID)
     expect(result.warning).toBe(
       `orca.yaml archive hook skipped for ${TEST_WORKTREE_PATH}; pass --run-hooks to run it.`
     )
+  })
+
+  it('coalesces concurrent runtime worktree removals for the same worktree id', async () => {
+    const runtime = new OrcaRuntimeService(store)
+    const removeStarted = deferred<void>()
+    const finishRemoval = deferred<void>()
+    vi.mocked(removeWorktree).mockImplementation(async () => {
+      removeStarted.resolve()
+      await finishRemoval.promise
+    })
+
+    const first = runtime.removeManagedWorktree(TEST_WORKTREE_ID, true)
+    const second = runtime.removeManagedWorktree(TEST_WORKTREE_ID, true)
+
+    await removeStarted.promise
+    await Promise.resolve()
+    expect(removeWorktree).toHaveBeenCalledTimes(1)
+
+    finishRemoval.resolve()
+    await expect(Promise.all([first, second])).resolves.toEqual([{}, {}])
+  })
+
+  it('rejects concurrent runtime worktree removals for the same id with different options', async () => {
+    const runtime = new OrcaRuntimeService(store)
+    const removeStarted = deferred<void>()
+    const finishRemoval = deferred<void>()
+    vi.mocked(removeWorktree).mockImplementation(async () => {
+      removeStarted.resolve()
+      await finishRemoval.promise
+    })
+
+    const first = runtime.removeManagedWorktree(TEST_WORKTREE_ID)
+
+    await removeStarted.promise
+    await expect(runtime.removeManagedWorktree(TEST_WORKTREE_ID, true)).rejects.toThrow(
+      'Worktree deletion already in progress'
+    )
+
+    expect(removeWorktree).toHaveBeenCalledTimes(1)
+    finishRemoval.resolve()
+    await expect(first).resolves.toEqual({})
+  })
+
+  it('treats forced runtime deletion of an already-missing unregistered worktree as cleanup', async () => {
+    const parentDir = await mkdtemp(join(tmpdir(), 'orca-runtime-remove-'))
+    const missingWorktreePath = join(parentDir, 'already-deleted')
+    const worktreeId = `${TEST_REPO_ID}::${missingWorktreePath}`
+    const { runtimeStore, removeWorktreeMeta } = createStaleRuntimeWorktreeStore(worktreeId)
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+    const notifier = { worktreesChanged: vi.fn() }
+    runtime.setNotifier(notifier as never)
+
+    try {
+      vi.mocked(listWorktrees).mockResolvedValue([])
+
+      await expect(runtime.removeManagedWorktree(worktreeId, true)).resolves.toEqual({})
+
+      expect(removeWorktree).not.toHaveBeenCalled()
+      expect(removeWorktreeMeta).toHaveBeenCalledWith(worktreeId)
+      expect(deleteWorktreeHistoryDirMock).toHaveBeenCalledWith(worktreeId)
+      expect(invalidateAuthorizedRootsCacheMock).toHaveBeenCalled()
+      expect(notifier.worktreesChanged).toHaveBeenCalledWith(TEST_REPO_ID)
+    } finally {
+      await rm(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('force-removes a legacy Orca-created runtime orphaned worktree directory after Git tracking is gone', async () => {
+    const parentDir = await mkdtemp(join(tmpdir(), 'orca-runtime-orphan-'))
+    const repoPath = join(parentDir, 'repo')
+    const orphanPath = join(parentDir, 'orphan')
+    const adminWorktreePath = join(repoPath, '.git', 'worktrees', 'orphan')
+    const worktreeId = `${TEST_REPO_ID}::${orphanPath}`
+    await mkdir(orphanPath, { recursive: true })
+    await mkdir(adminWorktreePath, { recursive: true })
+    await writeFile(join(orphanPath, '.git'), `gitdir: ${adminWorktreePath}\n`)
+    await writeFile(join(adminWorktreePath, 'gitdir'), `${join(orphanPath, '.git')}\n`)
+    const { runtimeStore, removeWorktreeMeta } = createStaleRuntimeWorktreeStore(worktreeId, {
+      createdAt: Date.now()
+    })
+    const runtimeStoreWithRepoPath = {
+      ...runtimeStore,
+      getRepos: () => [
+        {
+          id: TEST_REPO_ID,
+          path: repoPath,
+          displayName: 'repo',
+          badgeColor: 'blue',
+          addedAt: 1
+        }
+      ],
+      getRepo: (id: string) =>
+        id === TEST_REPO_ID
+          ? {
+              id: TEST_REPO_ID,
+              path: repoPath,
+              displayName: 'repo',
+              badgeColor: 'blue',
+              addedAt: 1
+            }
+          : undefined
+    }
+    const runtime = new OrcaRuntimeService(runtimeStoreWithRepoPath as never)
+    const notifier = { worktreesChanged: vi.fn() }
+    runtime.setNotifier(notifier as never)
+
+    try {
+      vi.mocked(listWorktrees).mockResolvedValue([])
+
+      await expect(runtime.removeManagedWorktree(worktreeId, true)).resolves.toEqual({})
+
+      await expect(lstat(orphanPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(removeWorktree).not.toHaveBeenCalled()
+      expect(removeWorktreeMeta).toHaveBeenCalledWith(worktreeId)
+      expect(deleteWorktreeHistoryDirMock).toHaveBeenCalledWith(worktreeId)
+      expect(invalidateAuthorizedRootsCacheMock).toHaveBeenCalled()
+      expect(notifier.worktreesChanged).toHaveBeenCalledWith(TEST_REPO_ID)
+    } finally {
+      await rm(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not inspect or delete a local path when SSH runtime orphan cleanup has no filesystem provider', async () => {
+    const localPath = await mkdtemp(join(tmpdir(), 'orca-runtime-ssh-missing-fs-'))
+    const repo = {
+      id: 'repo-runtime-ssh-missing-fs',
+      path: '/remote/repo',
+      displayName: 'ssh',
+      badgeColor: 'blue',
+      addedAt: 1,
+      connectionId: 'ssh-missing-fs'
+    }
+    const worktreeId = `${repo.id}::${localPath}`
+    const metaById: Record<string, WorktreeMeta> = {
+      [worktreeId]: makeWorktreeMeta({
+        orcaCreatedAt: Date.now(),
+        orcaCreationSource: 'ssh'
+      })
+    }
+    const removeWorktreeMeta = vi.fn((id: string) => {
+      delete metaById[id]
+    })
+    const runtimeStore = {
+      ...store,
+      getRepos: () => [repo],
+      getRepo: (id: string) => (id === repo.id ? repo : undefined),
+      getAllWorktreeMeta: () => metaById,
+      getWorktreeMeta: (id: string) => metaById[id],
+      setWorktreeMeta: (id: string, meta: Partial<WorktreeMeta>) => {
+        metaById[id] = { ...(metaById[id] ?? makeWorktreeMeta()), ...meta }
+        return metaById[id]
+      },
+      removeWorktreeMeta
+    }
+    const gitProvider = {
+      listWorktrees: vi.fn().mockResolvedValue([
+        {
+          path: repo.path,
+          head: 'main',
+          branch: 'refs/heads/main',
+          isBare: false,
+          isMainWorktree: true
+        }
+      ])
+    }
+    registerSshGitProvider(repo.connectionId, gitProvider as never)
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+
+    try {
+      await expect(runtime.removeManagedWorktree(`id:${worktreeId}`, true)).rejects.toThrow(
+        'SSH filesystem provider unavailable'
+      )
+
+      await expect(lstat(localPath)).resolves.toBeTruthy()
+      expect(removeWorktree).not.toHaveBeenCalled()
+      expect(removeWorktreeMeta).not.toHaveBeenCalled()
+    } finally {
+      unregisterSshGitProvider(repo.connectionId)
+      await rm(localPath, { recursive: true, force: true })
+    }
+  })
+
+  it('still rejects forced runtime unregistered delete paths that exist on disk', async () => {
+    const existingWorktreePath = await mkdtemp(join(tmpdir(), 'orca-runtime-remove-existing-'))
+    const worktreeId = `${TEST_REPO_ID}::${existingWorktreePath}`
+    const { runtimeStore, removeWorktreeMeta } = createStaleRuntimeWorktreeStore(worktreeId)
+    const runtime = new OrcaRuntimeService(runtimeStore as never)
+
+    try {
+      vi.mocked(listWorktrees).mockResolvedValue([])
+
+      await expect(runtime.removeManagedWorktree(worktreeId, true)).rejects.toThrow(
+        'Refusing to delete unregistered worktree path'
+      )
+
+      expect(removeWorktree).not.toHaveBeenCalled()
+      expect(removeWorktreeMeta).not.toHaveBeenCalled()
+    } finally {
+      await rm(existingWorktreePath, { recursive: true, force: true })
+    }
   })
 
   it('rejects CLI worktree removal when the target contains another registered worktree', async () => {
@@ -7724,6 +8395,7 @@ describe('OrcaRuntimeService', () => {
 
     await expect(runtime.removeManagedWorktree(TEST_WORKTREE_ID)).resolves.toEqual({})
     expect(removeWorktree).toHaveBeenCalledWith(TEST_REPO_PATH, TEST_WORKTREE_PATH, false)
+    expect(deleteWorktreeHistoryDirMock).toHaveBeenCalledWith(TEST_WORKTREE_ID)
   })
 
   it('runs archive hooks for CLI worktree removal when hooks are explicitly enabled', async () => {

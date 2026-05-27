@@ -109,6 +109,7 @@ export type BrowserSlice = {
     url: string,
     options?: CreateBrowserTabOptions
   ) => BrowserWorkspace
+  openNewBrowserTabInActiveWorkspace: (groupId: string) => Promise<void>
   closeBrowserTab: (tabId: string) => void
   shutdownWorktreeBrowsers: (worktreeId: string) => Promise<void>
   reopenClosedBrowserTab: (worktreeId: string) => BrowserWorkspace | null
@@ -513,10 +514,39 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       state.createUnifiedTab(worktreeId, 'browser', {
         entityId: workspaceId,
         label: browserTab.title,
-        targetGroupId: options?.targetGroupId
+        targetGroupId: options?.targetGroupId,
+        activate: options?.activate ?? true
       })
     }
     return browserTab
+  },
+
+  openNewBrowserTabInActiveWorkspace: async (groupId) => {
+    const state = get()
+    const worktreeId = state.activeWorktreeId
+    if (!worktreeId) {
+      return
+    }
+    const defaultUrl = state.browserDefaultUrl ?? 'about:blank'
+    const pairedWebRuntimeEnvironmentId = (globalThis as { __ORCA_WEB_CLIENT__?: boolean })
+      .__ORCA_WEB_CLIENT__
+      ? state.settings?.activeRuntimeEnvironmentId?.trim()
+      : null
+    if (pairedWebRuntimeEnvironmentId) {
+      const { createWebRuntimeSessionBrowserTab } = await import('@/runtime/web-runtime-session')
+      await createWebRuntimeSessionBrowserTab({
+        worktreeId,
+        environmentId: pairedWebRuntimeEnvironmentId,
+        url: defaultUrl,
+        targetGroupId: groupId
+      })
+      return
+    }
+    get().createBrowserTab(worktreeId, defaultUrl, {
+      title: 'New Browser Tab',
+      focusAddressBar: true,
+      targetGroupId: groupId
+    })
   },
 
   closeBrowserTab: (tabId) => {

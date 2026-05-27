@@ -21,6 +21,7 @@ import {
 import logo from '../../../resources/logo.svg'
 import { SYNC_FIT_PANES_EVENT, TOGGLE_TERMINAL_PANE_EXPAND_EVENT } from '@/constants/terminal'
 import { syncZoomCSSVar } from '@/lib/ui-zoom'
+import { canShowRightSidebarForView } from '@/lib/right-sidebar-visibility'
 import { buildAppFontFamily } from '@/lib/app-font-family'
 import { toast } from 'sonner'
 import { Toaster } from '@/components/ui/sonner'
@@ -44,7 +45,6 @@ import RightSidebar from './components/right-sidebar'
 import { StatusBar } from './components/status-bar/StatusBar'
 import { UpdateCard } from './components/UpdateCard'
 import { StarNagCard } from './components/StarNagCard'
-import { FeatureTourNudge } from './components/feature-wall/FeatureTourNudge'
 import { TelemetryFirstLaunchSurface } from './components/TelemetryFirstLaunchSurface'
 import { ZoomOverlay } from './components/ZoomOverlay'
 import { onOnboardingReopened } from './components/onboarding/show-onboarding-event'
@@ -97,6 +97,7 @@ import {
   hydratePersistedUIAfterStartupRead
 } from './lib/startup-ui-hydration'
 import { applyDocumentTheme } from './lib/document-theme'
+import { getSystemPrefersDark } from './lib/terminal-theme'
 import { isEditableTarget } from './lib/editable-target'
 import { getSelectedTextForFileSearch } from './lib/file-search-selection'
 import { useShortcutLabel } from './hooks/useShortcutLabel'
@@ -205,6 +206,7 @@ const ActivityPrototypePage = lazy(() => import('./components/activity/ActivityP
 const Settings = lazy(() => import('./components/settings/Settings'))
 const SkillsPage = lazy(() => import('./components/skills/SkillsPage'))
 const WorkspaceSpacePage = lazy(() => import('./components/workspace-space/WorkspaceSpacePage'))
+const MobilePage = lazy(() => import('./components/mobile/MobilePage'))
 const QuickOpen = lazy(() => import('./components/QuickOpen'))
 const WorktreeJumpPalette = lazy(() => import('./components/WorktreeJumpPalette'))
 const NewWorkspaceComposerModal = lazy(() => import('./components/NewWorkspaceComposerModal'))
@@ -399,6 +401,7 @@ function App(): React.JSX.Element {
   const persistedUIReady = useAppStore((s) => s.persistedUIReady)
   const rightSidebarWidth = useAppStore((s) => s.rightSidebarWidth)
   const rightSidebarOpen = useAppStore((s) => s.rightSidebarOpen)
+  const rightSidebarTab = useAppStore((s) => s.rightSidebarTab)
   const isFullScreen = useAppStore((s) => s.isFullScreen)
   const settings = useAppStore((s) => s.settings)
   const primarySelectionMiddleClickPaste = resolvePrimarySelectionMiddleClickPaste(
@@ -774,14 +777,27 @@ function App(): React.JSX.Element {
   useEffect(() => {
     let previousKey = getRuntimeMobileSessionSyncKey(useAppStore.getState())
     return useAppStore.subscribe((state, previousState) => {
+      const systemPrefersDark = getSystemPrefersDark()
       // Why: skip the key build entirely when every input field is unchanged
       // by reference. Mirrors every field used by
       // getRuntimeMobileSessionSyncKey so this gate covers every "could the
       // key have changed?" case.
-      if (canSkipRuntimeMobileSessionSyncKeyBuild(state, previousState)) {
+      if (
+        canSkipRuntimeMobileSessionSyncKeyBuild(
+          state,
+          previousState,
+          systemPrefersDark,
+          previousKey.systemPrefersDark
+        )
+      ) {
         return
       }
-      const nextKey = getRuntimeMobileSessionSyncKey(state, previousState, previousKey)
+      const nextKey = getRuntimeMobileSessionSyncKey(
+        state,
+        previousState,
+        previousKey,
+        systemPrefersDark
+      )
       if (runtimeMobileSessionSyncKeysEqual(nextKey, previousKey)) {
         return
       }
@@ -890,6 +906,8 @@ function App(): React.JSX.Element {
     const timer = window.setTimeout(() => {
       void window.api.ui.set({
         sidebarWidth,
+        rightSidebarOpen,
+        rightSidebarTab,
         rightSidebarWidth,
         groupBy,
         sortBy,
@@ -911,6 +929,8 @@ function App(): React.JSX.Element {
   }, [
     persistedUIReady,
     sidebarWidth,
+    rightSidebarOpen,
+    rightSidebarTab,
     rightSidebarWidth,
     groupBy,
     sortBy,
@@ -936,7 +956,12 @@ function App(): React.JSX.Element {
       // system
       const mq = window.matchMedia('(prefers-color-scheme: dark)')
       applyDocumentTheme('system')
-      const handler = (): void => applyDocumentTheme('system')
+      const handler = (): void => {
+        applyDocumentTheme('system')
+        // Why: system theme changes do not mutate the store, so mobile
+        // terminal colors need an explicit graph republish.
+        scheduleRuntimeGraphSync()
+      }
       mq.addEventListener('change', handler)
       return () => mq.removeEventListener('change', handler)
     }
@@ -990,13 +1015,7 @@ function App(): React.JSX.Element {
   const workspaceActive = activeView === 'terminal' && activeWorktreeId !== null
   // Why: suppress right sidebar controls on full-page navigation surfaces
   // since those surfaces intentionally own the full content area.
-  const showRightSidebarControls =
-    activeView !== 'settings' &&
-    activeView !== 'tasks' &&
-    activeView !== 'activity' &&
-    activeView !== 'automations' &&
-    activeView !== 'space' &&
-    activeView !== 'skills'
+  const showRightSidebarControls = canShowRightSidebarForView(activeView)
 
   const handleToggleExpand = (): void => {
     if (!effectiveActiveTabId) {
@@ -1055,12 +1074,7 @@ function App(): React.JSX.Element {
         })
       }
 
-      const canRevealRightSidebar =
-        activeView !== 'tasks' &&
-        activeView !== 'activity' &&
-        activeView !== 'automations' &&
-        activeView !== 'space' &&
-        activeView !== 'skills'
+      const canRevealRightSidebar = canShowRightSidebarForView(activeView)
 
       const openSearchSidebar = (query: string | null): void => {
         if (query && activeWorktreeId) {
@@ -1141,7 +1155,12 @@ function App(): React.JSX.Element {
       // counterpart, so suppressing them here would silently no-op when
       // focus lives inside the floating panel.
       if (isFloatingWorkspacePanelFocused()) {
-        if (isFloatingWorkspacePanelShortcut(e, isMac)) {
+        if (
+          isFloatingWorkspacePanelShortcut(e, shortcutPlatform, null, keybindings, {
+            context,
+            terminalShortcutPolicy: settings?.terminalShortcutPolicy
+          })
+        ) {
           return
         }
       }
@@ -1450,21 +1469,6 @@ function App(): React.JSX.Element {
     </Tooltip>
   ) : null
 
-  useEffect(() => {
-    if (
-      (activeView === 'tasks' ||
-        activeView === 'activity' ||
-        activeView === 'automations' ||
-        activeView === 'space' ||
-        activeView === 'skills') &&
-      rightSidebarOpen
-    ) {
-      // Why: hide the right sidebar immediately when entering full-page
-      // navigation views so previous side-panel state cannot occlude them.
-      actions.setRightSidebarOpen(false)
-    }
-  }, [activeView, rightSidebarOpen, actions])
-
   return (
     <div
       className="flex flex-col h-screen w-screen overflow-hidden"
@@ -1642,14 +1646,12 @@ function App(): React.JSX.Element {
                       {activeView === 'automations' ? <AutomationsPage /> : null}
                       {activeView === 'activity' ? <ActivityPrototypePage /> : null}
                       {activeView === 'space' ? <WorkspaceSpacePage /> : null}
+                      {activeView === 'mobile' ? <MobilePage /> : null}
                       {activeView === 'terminal' && !activeWorktreeId ? <Landing /> : null}
                     </Suspense>
                   </div>
                   {showFloatingTerminalButton ? (
                     <FloatingTerminalToggleButton
-                      // Why: anchor the floating trigger to the center surface so it
-                      // cannot cover the worktree sidebar or right sidebar.
-                      className="absolute bottom-3 right-3"
                       open={floatingTerminalOpen}
                       onToggle={() => setFloatingTerminalOpenWithFocus((open) => !open)}
                     />
@@ -1695,7 +1697,6 @@ function App(): React.JSX.Element {
             </Suspense>
           ) : null}
           <UpdateCard />
-          <FeatureTourNudge />
           <StarNagCard />
           {/* Why: the existing-user opt-in banner mounts at App root so it
           renders once per renderer session, not per view. It gates
